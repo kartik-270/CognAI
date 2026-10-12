@@ -1,7 +1,7 @@
 # CognAI — Product Requirements Document (PRD)
 
 ## 1. Introduction
-CognAI is an intelligent, personalized cognitive companion. Unlike standard conversational agents that suffer from "goldfish memory" or context-window overflow, CognAI is designed to maintain long-term, coherent, and deeply personalized relationships with users. It achieves this by mimicking human neurobiology: separating working memory, episodic memory, and permanent semantic schemas into a dynamic, active reconstruction process.
+CognAI is an intelligent, personalized cognitive companion built on the premise of continuous learning and growth through user interaction. Unlike standard conversational agents that suffer from "goldfish memory" or context-window overflow, CognAI is designed to maintain long-term, coherent, and deeply personalized relationships with users. It achieves this by mimicking human neurobiology: separating working memory, episodic memory, and permanent semantic schemas into a dynamic, active reconstruction process that evolves alongside the user.
 
 ## 2. Problem Statement
 Current LLM agents and basic RAG architectures fail at long-term continuity due to several critical limitations:

@@ -1,85 +1,100 @@
-# CognAI
+# CognAI — A Research-Grounded Cognitive Companion
 
-**A Research-Grounded, Mobile-First Cognitive Companion**
+CognAI is an intelligent, personalized cognitive companion built on the premise of **continuous learning and growth through user interaction**. Unlike standard conversational agents that suffer from context-window overflow or static personas, CognAI is designed to maintain long-term, coherent, and deeply personalized relationships. It achieves this by mimicking human neurobiology: separating working memory, episodic memory, and permanent semantic schemas into a dynamic, active reconstruction process.
 
-CognAI is an advanced cognitive AI architecture designed to move beyond simple Retrieval-Augmented Generation (RAG). It implements a **closed-loop feedback system** utilizing biologically-inspired memory hierarchies, metacognitive self-monitoring, and dynamic persona adaptation. 
+## Core Cognitive Architecture
 
-Unlike standard conversational agents that suffer from "goldfish memory" or context-window overflow, CognAI maintains long-term, coherent relationships with users by separating working memory, episodic memory, and permanent semantic schemas into a dynamic, active reconstruction process.
+1. **Surprise-Gated Consolidation**: The AI only remembers what matters. By mathematically measuring "surprise" against historical knowledge, it selectively permanently encodes novel or contradictory information.
+2. **5-Signal Persona Drift**: The AI implicitly analyzes your verbosity, formality, and inquiry rates. Over time, its own personality naturally drifts to mirror your communication style.
+3. **Goal-Conditioned Forgetting**: Memories degrade dynamically based on their relevance to your current life goals, preventing the AI from fixating on outdated context.
+4. **Emotional Valence Tagging**: The system maps the emotional intensity of conversations, allowing it to proactively adjust its empathy and tone over time.
+5. **Metacognitive Monitor**: The AI possesses a "Thinking Governor." When uncertainty is high, it deliberately shifts into "slow-think" mode or actively asks you clarifying questions.
 
----
+## Technology Stack
 
-## Key Innovations
+### Backend (FastAPI)
+- **Framework**: FastAPI (Python 3.10)
+- **Database**: PostgreSQL with `pgvector` (`bge-m3` 1024-dim dense vectors)
+- **Graph DB**: Neo4j Community Edition (for semantic schemas)
+- **Caching & Brokers**: Redis
+- **Background Processing**: Celery (Rate-limited for API safety)
+- **LLM Routing**: 
+  - **Chat**: Groq (Low-latency real-time reasoning)
+  - **Background**: Gemini 2.0 Flash / Qwen 2.5 (Memory consolidation & schemas)
+- **Auth**: Native JWT via Email & Google OAuth2
 
-1. **Surprise-Gated Consolidation**: Uses Cosine Distance to measure episodic surprise against a user's historical prior, triggering prioritized memory consolidation for unexpected interactions.
-2. **Goal-Conditioned Forgetting**: Simulates hippocampal tagging by slowing the decay rate of memories relevant to active inferred goals.
-3. **Metacognitive Monitor**: A "Thinking Governor" that evaluates response confidence, detects contradictions, and dynamically shifts between fast and slow reasoning modes.
-4. **Emotional Valence Tagging**: Modulates memory retrieval and decay based on the affective intensity and valence of the interaction.
-5. **Closed-Loop Persona Drift**: Online adaptation of the AI's interaction style based on 5 implicit, high-signal user behaviors (verbosity, rephrasing, casual markers, question frequency, topic return rate).
+### Frontend (Flutter)
+- **Framework**: Flutter (iOS & Android compatible)
+- **State Management**: Riverpod (for reactive WebSocket streams)
+- **Design System**: "Luminous Minimal" (Quiet Premium aesthetic)
+- **Network**: WebSockets (Real-time chat + metacognitive indicators) with automatic reconnection.
 
----
+## Infrastructure & DevOps
 
-## Architecture Stack
+The project includes a robust DevOps pipeline. To initialize the backend stack locally:
 
-### LLM & Intelligence
-- **Core LLM Library**: Unified multi-provider engine (OpenAI, Anthropic, Gemini, Groq, Qwen).
-- **Real-Time Reasoning**: Groq API (Llama 3.3 70B & 3.1 8B Instant) – Reserved strictly for low-latency chat.
-- **Background Processing**: Google Gemini 2.0 Flash / Local Qwen 2.5 – Handles memory consolidation, entity extraction, and goal inference to protect chat API rate limits.
-- **Orchestration**: LangGraph state machine.
+```bash
+# 1. Start the databases and Redis
+make up
 
-### Memory & Persistence
-- **Embeddings**: `BAAI/bge-m3` (1024-dimensional dense vectors).
-- **Vector DB**: PostgreSQL + pgvector (`vector(1024)`) for episodic and permanent memory.
-- **Graph DB**: Neo4j Community Edition for storing entity-relation triples.
-- **Cache & Message Broker**: Redis.
+# 2. View container logs
+make logs
+```
 
-### Infrastructure & Mobile
-- **Backend API**: FastAPI (Python).
-- **Background Workers**: Celery + Redis (Strictly rate-limited to `10/m`).
-- **Authentication**: JWT secured via manual Email and Google Provider (OAuth2).
-- **Mobile Client**: Flutter.
-
----
-
-## Security & Privacy
-- **Authentication**: Standardized Email & Google OAuth2 flow issuing secure JWTs for WebSocket streaming.
-- **Tenant Isolation**: Strict row-level isolation by `user_id` across PostgreSQL and Neo4j.
-- **Compliance**: A fully implemented `/forget-me` endpoint triggering cascading deletes of all episodic data, permanent memories, and graph triples for the requesting user.
-
----
-
-## Setup & Local Development
-
-### Prerequisites
-- Docker & Docker Compose
-- Python 3.10+
-- Node/Flutter SDK (for mobile client)
-
-### Environment Variables (`.env`)
+### Environment Setup (`.env`)
+You must provide the following variables for the backend to function:
 ```env
-# LLM API Keys
+# Databases
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=postgrespassword
+POSTGRES_DB=cognai
+
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=neo4jpassword
+
+# LLMs
 GROQ_API_KEY=your_groq_key
 GEMINI_API_KEY=your_gemini_key
-# QWEN_API_KEY=your_qwen_key 
 
-# Databases
-DATABASE_URL=postgresql://postgres:postgres@localhost:5432/cognai
-REDIS_URL=redis://localhost:6379/0
-NEO4J_URI=bolt://localhost:7687
-NEO4J_USER=neo4j
-NEO4J_PASSWORD=password
+# Auth
+GOOGLE_CLIENT_ID=your_google_oauth_client_id
+GOOGLE_CLIENT_SECRET=your_google_oauth_secret
 ```
 
-### Running the Services
+### Starting the Backend
 ```bash
-# 1. Start Infrastructure (PostgreSQL, pgvector, Redis, Neo4j)
-docker-compose up -d
-
-# 2. Run Database Migrations
-alembic upgrade head
-
-# 3. Start FastAPI Backend
-uvicorn cognai.api.main:app --reload --port 8000
-
-# 4. Start Celery Worker (Rate-limited background consolidation)
-celery -A cognai.workers.celery_app worker --loglevel=info
+cd backend
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+pip install -r requirements.txt
+uvicorn app.api.main:app --reload
 ```
+
+### Starting the Frontend
+```bash
+cd frontend/cognai_app
+flutter pub get
+flutter run
+```
+### Database commands
+```bash
+
+make db-migrate m="Add chat_messages table"
+make db-upgrade
+
+
+  ```
+db-migrate:
+	docker-compose exec backend alembic revision --autogenerate -m "$(m)"
+db-upgrade:
+	docker-compose exec backend alembic upgrade head
+
+
+## Repository Structure
+- `backend/`: FastAPI core, Celery workers, LangGraph orchestrator, and Database models.
+- `frontend/cognai_app/`: Feature-first Flutter application utilizing Riverpod and local assets.
+- `terraform/`: Infrastructure-as-code for AWS deployment.
+- `docker-compose.yml`: Local orchestrator for PostgreSQL (pg16 + pgvector), Neo4j, and Redis.
+
+## Privacy Note
+CognAI is built with strict row-level isolation per user. It features a transactional `/forget-me` compliance endpoint that guarantees a two-phase cascading delete of all vectors, graph nodes, and episodic data across the system.
