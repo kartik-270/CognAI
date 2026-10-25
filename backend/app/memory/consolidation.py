@@ -6,11 +6,39 @@ import json
 import re
 import logging
 
-from app.db.models import PermanentMemory, Episode, User, Goal
+from app.db.models import PermanentMemory, Episode, User, Goal, CognitiveSchema
 from app.llm.router import llm_router
 from app.graph.neo4j_client import neo4j_client
 
 logger = logging.getLogger(__name__)
+
+SCHEMA_SYNTHESIS_PROMPT = """
+You are a cognitive psychologist and cognitive memory consolidation system.
+Analyze the following collection of permanent user facts and episodic themes.
+Synthesize high-level Level-3 Cognitive Schemas.
+A Cognitive Schema is an enduring, overarching mental model, core philosophy, habitual workflow, or worldview that explains multiple individual facts.
+
+Existing User Facts:
+\"\"\"
+{facts_text}
+\"\"\"
+
+Guidelines:
+- Identify 1-3 unifying schemas across the facts (e.g. "Software Architecture Philosophy", "Personal Learning Style", "Core Health & Daily Routine", "Long-term Research Direction").
+- Schema 'domain' must be one of: 'technical', 'personal', 'workflow', 'philosophy'.
+- Provide a clear, robust 2-4 sentence summary synthesizing the facts into an enduring principle.
+- Return ONLY a JSON array of schema objects:
+[
+  {{
+    "title": "...",
+    "domain": "technical|personal|workflow|philosophy",
+    "summary": "...",
+    "supporting_facts_count": 3,
+    "confidence": 0.90
+  }}
+]
+"""
+
 
 FACT_EXTRACTION_PROMPT = """
 You are an expert memory consolidation system. Extract long-term permanent facts, user preferences, habits, beliefs, and stated goals from this session transcript.
@@ -136,25 +164,43 @@ class MemoryConflictResolver:
             await self.db.commit()
             return {"action": "inserted", "fact": candidate_fact}
 
-        # High semantic overlap detected: invoke LLM contradiction check
-        prompt = CONFLICT_RESOLUTION_PROMPT.format(
-            existing_fact=conflicting_memory.fact,
-            existing_category=conflicting_memory.category,
-            new_fact=candidate_fact,
-            new_category=category
-        )
-        raw_res = await llm_router.background_task(prompt)
-        
-        resolution = "COMPATIBLE_KEEP_BOTH"
+        # High semantic overlap detected: check Node 8 SLM contradiction resolver first
+        resolution = None
         merged_fact = ""
         try:
-            match = re.search(r'\{.*\}', raw_res, re.DOTALL)
-            if match:
-                parsed = json.loads(match.group(0))
-                resolution = parsed.get("resolution", "COMPATIBLE_KEEP_BOTH")
-                merged_fact = parsed.get("merged_fact", "")
+            from app.brain.slm_contradiction_resolver import get_slm_contradiction_resolver
+            slm_resolver = get_slm_contradiction_resolver()
+            if slm_resolver:
+                action, conf_score, _ = slm_resolver.resolve_conflict(conflicting_memory.fact, candidate_fact)
+                if action == "REPLACE":
+                    resolution = "CONTRADICTION_REPLACE"
+                elif action == "KEEP_BOTH" or action == "NO_CONFLICT":
+                    resolution = "COMPATIBLE_KEEP_BOTH"
+                elif action == "MERGE":
+                    resolution = "MERGE"
+                    merged_fact = f"{conflicting_memory.fact} Additionally, {candidate_fact}"
         except Exception:
             pass
+
+        # Fallback to background LLM contradiction prompt if SLM unresolved
+        if not resolution:
+            prompt = CONFLICT_RESOLUTION_PROMPT.format(
+                existing_fact=conflicting_memory.fact,
+                existing_category=conflicting_memory.category,
+                new_fact=candidate_fact,
+                new_category=category
+            )
+            raw_res = await llm_router.background_task(prompt)
+            
+            resolution = "COMPATIBLE_KEEP_BOTH"
+            try:
+                match = re.search(r'\{.*\}', raw_res, re.DOTALL)
+                if match:
+                    parsed = json.loads(match.group(0))
+                    resolution = parsed.get("resolution", "COMPATIBLE_KEEP_BOTH")
+                    merged_fact = parsed.get("merged_fact", "")
+            except Exception:
+                pass
 
         if resolution == "CONTRADICTION_REPLACE":
             # Replace existing conflicting memory
@@ -273,6 +319,9 @@ class MemoryConsolidator:
         # Priority 2 (Gap B): Extract entity triples → Neo4j knowledge graph
         entity_actions = await self._extract_entities_to_graph(user_id, transcript)
 
+        # Multi-Granularity Consolidation: Level-3 Schemas synthesis
+        schema_actions = await self.synthesize_cognitive_schemas(user_id)
+
         return {
             "status": "consolidated",
             "session_id": session_id,
@@ -280,7 +329,8 @@ class MemoryConsolidator:
             "facts_extracted_count": len(extracted_facts),
             "resolutions": actions,
             "goals_inferred": goal_actions,
-            "entities_extracted": entity_actions
+            "entities_extracted": entity_actions,
+            "schemas_synthesized": schema_actions
         }
 
     async def _extract_entities_to_graph(
@@ -318,6 +368,87 @@ class MemoryConsolidator:
             return results
         except Exception as e:
             logger.warning(f"Entity extraction failed for user {user_id}: {e}")
+            return []
+
+    async def synthesize_cognitive_schemas(self, user_id: str) -> List[Dict[str, Any]]:
+        """
+        Synthesizes Level-3 Cognitive Schemas from accumulated Level-2 permanent facts.
+        Extracts enduring philosophies, worldviews, and workflows.
+        """
+        stmt = select(PermanentMemory).where(
+            PermanentMemory.user_id == user_id,
+            PermanentMemory.embedding.isnot(None)
+        ).order_by(PermanentMemory.created_at.desc()).limit(50)
+        res = await self.db.execute(stmt)
+        facts = res.scalars().all()
+
+        if len(facts) < 3:
+            return []
+
+        facts_text = "\n".join([f"- [{f.category}] {f.fact}" for f in facts])
+        prompt = SCHEMA_SYNTHESIS_PROMPT.format(facts_text=facts_text)
+
+        try:
+            raw_output = await llm_router.background_task(prompt)
+            match = re.search(r'\[.*\]', raw_output, re.DOTALL)
+            if not match:
+                return []
+
+            schemas_data = json.loads(match.group(0))
+            persisted = []
+
+            for s_item in schemas_data:
+                title = str(s_item.get("title", "")).strip()
+                summary = str(s_item.get("summary", "")).strip()
+                domain = str(s_item.get("domain", "general")).strip().lower()
+                conf = float(s_item.get("confidence", 0.9))
+                fact_count = int(s_item.get("supporting_facts_count", len(facts)))
+
+                if not title or not summary:
+                    continue
+
+                emb = await llm_router.embed(f"{title}: {summary}")
+
+                # Check if existing schema with same or similar title exists for user
+                existing_stmt = select(CognitiveSchema).where(
+                    CognitiveSchema.user_id == user_id,
+                    CognitiveSchema.domain == domain
+                )
+                ex_res = await self.db.execute(existing_stmt)
+                existing_schemas = ex_res.scalars().all()
+
+                matched = None
+                for ex in existing_schemas:
+                    if ex.title.lower() == title.lower() or (ex.embedding and MemoryConflictResolver._cosine_similarity(np.array(emb), np.array(ex.embedding)) > 0.80):
+                        matched = ex
+                        break
+
+                if matched:
+                    matched.title = title
+                    matched.summary = summary
+                    matched.confidence = conf
+                    matched.supporting_facts_count = fact_count
+                    matched.embedding = emb
+                    await self.db.commit()
+                    persisted.append({"action": "updated", "title": title, "domain": domain})
+                else:
+                    new_schema = CognitiveSchema(
+                        user_id=user_id,
+                        title=title,
+                        summary=summary,
+                        domain=domain,
+                        confidence=conf,
+                        supporting_facts_count=fact_count,
+                        embedding=emb
+                    )
+                    self.db.add(new_schema)
+                    await self.db.commit()
+                    persisted.append({"action": "created", "title": title, "domain": domain})
+
+            logger.info(f"Synthesized {len(persisted)} Level-3 Cognitive Schemas for user {user_id}")
+            return persisted
+        except Exception as e:
+            logger.warning(f"Cognitive schema synthesis warning for user {user_id}: {e}")
             return []
 
     async def run_hdbscan_clustering(self, user_id: str, min_cluster_size: int = 2) -> Dict[str, Any]:

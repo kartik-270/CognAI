@@ -10,6 +10,7 @@ from app.memory.permanent import PermanentMemoryManager
 from app.persona.drift import PersonaDriftEngine
 from app.brain.metacognition import MetacognitiveMonitor, ThinkingMode
 from app.brain.context_assembler import ContextAssembler
+from app.brain.proactive import ProactiveMemoryEngine
 from app.llm.router import llm_router
 from app.db.models import User, DocumentAttachment
 from app.services.storage import get_storage_service
@@ -34,12 +35,13 @@ class CognitiveOrchestrator:
     Executes the closed-loop cognitive cycle:
     1. Lazy session boundary check (> 30 min inactivity)
     2. Working memory update & rephrasing detection
-    3. Multi-factor memory retrieval with temporal weighting
+    3. Multi-factor memory retrieval with temporal weighting & PPR Graph
     4. Metacognitive confidence estimation & mode routing
-    5. Context assembly with active goals & persona directives
-    6. Response generation via low-latency Groq
-    7. 5-Signal persona drift update
-    8. Celery background dispatch on boundary expiration
+    5. Proactive memory & curiosity-driven opportunity evaluation
+    6. Context assembly with active goals, Level-3 schemas & persona directives
+    7. Response generation via low-latency Groq
+    8. 5-Signal persona drift update
+    9. Celery background dispatch on boundary expiration
     """
     def __init__(self, db: AsyncSession):
         self.db = db
@@ -47,6 +49,7 @@ class CognitiveOrchestrator:
         self.permanent_mgr = PermanentMemoryManager(db)
         self.persona_engine = PersonaDriftEngine(db)
         self.metacognition = MetacognitiveMonitor(fast_think_threshold=0.40, clarify_threshold=0.20)
+        self.proactive_engine = ProactiveMemoryEngine(db)
 
     async def ingest_turn(self, user_id: str, role: str, content: str, timestamp: Optional[datetime] = None, source_id: Optional[str] = None, sync_consolidation: bool = False) -> None:
         """
@@ -148,10 +151,11 @@ class CognitiveOrchestrator:
     async def step(self, user_id: str, prompt: str, update_state: bool = True, now: Optional[datetime] = None, attachment_ids: Optional[List[str]] = None) -> Dict[str, Any]:
         wm = get_working_memory(user_id)
         doc_contexts, image_urls = await self._resolve_attachments(user_id, attachment_ids)
+        prompt_emb = await llm_router.embed(prompt)
 
         if update_state:
-            # 1. Process turn in working memory (lazy session boundary & rephrase detection)
-            turn_result = wm.process_incoming_turn("user", prompt, timestamp=now)
+            # 1. Process turn in working memory (lazy session boundary, rephrase detection & turn-level surprise)
+            turn_result = wm.process_incoming_turn("user", prompt, timestamp=now, turn_embedding=prompt_emb)
             
             # If lazy boundary was crossed, dispatch background consolidation for the expired session
             if turn_result["session_expired"]:
@@ -169,10 +173,12 @@ class CognitiveOrchestrator:
                     logger.warning(f"Could not dispatch async consolidation task: {e}")
             is_rephrasing = turn_result["is_rephrasing"]
             rephrase_score = turn_result["rephrase_score"]
+            turn_surprise = turn_result.get("turn_surprise", 0.5)
             working_msgs = wm.messages[:-1]
         else:
             # Non-mutating mode: evaluation query against fixed memory state without polluting context
             is_rephrasing, rephrase_score = wm.rephrase_detector.check_rephrasing(prompt, wm.messages)
+            turn_surprise = wm.compute_turn_surprise(prompt_emb)
             working_msgs = list(wm.messages)
 
         # 2. Check user session count for cold-start onboarding
@@ -186,7 +192,17 @@ class CognitiveOrchestrator:
         active_goals = await self.permanent_mgr.get_active_goals(user_id)
         goals_embeddings = [g.embedding for g in active_goals if g.embedding is not None]
 
-        # 4. Extract semantic intent & proactive memory flag
+        # 4. Proactive Memory Engine: evaluate stalled goal or curiosity opportunity
+        proactive_eval = await self.proactive_engine.evaluate_proactive_opportunity(
+            user_id=user_id,
+            query=prompt,
+            query_embedding=prompt_emb,
+            working_messages=working_msgs,
+            now=now
+        )
+        proactive_nudge = proactive_eval.get("directive") if proactive_eval.get("triggered") else None
+
+        # 5. Extract semantic intent & proactive memory flag
         intent_res = await self.metacognition.detect_intent(prompt, now=now)
         intent = intent_res.get("intent", "general")
         
@@ -200,6 +216,8 @@ class CognitiveOrchestrator:
                     "mode_rationale": "Blocked prompt injection attempt.",
                     "is_rephrasing": is_rephrasing,
                     "rephrase_score": rephrase_score,
+                    "turn_surprise": turn_surprise,
+                    "proactive_memory": proactive_eval,
                     "retrieved_memories_count": 0,
                     "retrieved_memories": [],
                     "is_cold_start": is_cold_start,
@@ -210,7 +228,7 @@ class CognitiveOrchestrator:
         date_range = intent_res.get("date_range")
         requires_retrieval = intent_res.get("requires_retrieval", True)
 
-        # 5. Multi-factor memory retrieval with temporal term (Proactive Memory)
+        # 6. Multi-factor memory retrieval with temporal term & Personalized PageRank
         retrieved_memories = []
         if requires_retrieval:
             retrieved_memories = await self.retriever.retrieve(
@@ -223,7 +241,7 @@ class CognitiveOrchestrator:
                 date_range=date_range
             )
 
-        # 5. Metacognitive Confidence Evaluation & Mode Routing
+        # 7. Metacognitive Confidence Evaluation & Mode Routing
         meta_eval = self.metacognition.estimate_confidence(
             query=prompt,
             retrieved_memories=retrieved_memories,
@@ -233,13 +251,13 @@ class CognitiveOrchestrator:
         )
         thinking_mode: ThinkingMode = meta_eval["mode"]
 
-        # 6. Fetch / update persona state
+        # 8. Fetch / update persona state
         persona_state = await self.persona_engine.get_or_create_profile(user_id)
 
         # Fetch permanent facts for identity and project context continuity
         permanent_facts = await self.permanent_mgr.get_user_facts(user_id, limit=20)
 
-        # 7. Assemble Unified Prompt
+        # 9. Assemble Unified Prompt
         assembled_prompt = ContextAssembler.build_prompt(
             user_query=prompt,
             working_messages=working_msgs, # prior turns
@@ -250,10 +268,11 @@ class CognitiveOrchestrator:
             is_cold_start=is_cold_start,
             now=now,
             permanent_facts=permanent_facts,
-            attached_documents=doc_contexts
+            attached_documents=doc_contexts,
+            proactive_nudge=proactive_nudge
         )
 
-        # 8. Generate response via metacognitive-routed LLM provider
+        # 10. Generate response via metacognitive-routed LLM provider
         if image_urls:
             response_text = await llm_router.chat(assembled_prompt, images=image_urls)
         elif thinking_mode == ThinkingMode.SLOW_THINK:
@@ -296,6 +315,8 @@ class CognitiveOrchestrator:
                 "mode_rationale": meta_eval["rationale"],
                 "is_rephrasing": is_rephrasing,
                 "rephrase_score": rephrase_score,
+                "turn_surprise": turn_surprise,
+                "proactive_memory": proactive_eval,
                 "retrieved_memories_count": len(retrieved_memories),
                 "retrieved_memories": [m.to_dict() for m in retrieved_memories],
                 "is_cold_start": is_cold_start,
@@ -310,9 +331,10 @@ class CognitiveOrchestrator:
         """
         wm = get_working_memory(user_id)
         doc_contexts, image_urls = await self._resolve_attachments(user_id, attachment_ids)
+        prompt_emb = await llm_router.embed(prompt)
 
         if update_state:
-            turn_result = wm.process_incoming_turn("user", prompt, timestamp=now)
+            turn_result = wm.process_incoming_turn("user", prompt, timestamp=now, turn_embedding=prompt_emb)
             if turn_result["session_expired"]:
                 from app.workers.tasks import consolidate_session_task
                 expired_transcript = "\n".join([f"{m.role}: {m.content}" for m in turn_result["expired_messages"]])
@@ -328,9 +350,11 @@ class CognitiveOrchestrator:
                     logger.warning(f"Could not dispatch async consolidation task: {e}")
             is_rephrasing = turn_result["is_rephrasing"]
             rephrase_score = turn_result["rephrase_score"]
+            turn_surprise = turn_result.get("turn_surprise", 0.5)
             working_msgs = wm.messages[:-1]
         else:
             is_rephrasing, rephrase_score = wm.rephrase_detector.check_rephrasing(prompt, wm.messages)
+            turn_surprise = wm.compute_turn_surprise(prompt_emb)
             working_msgs = list(wm.messages)
 
         # 2. Check user session count
@@ -344,7 +368,17 @@ class CognitiveOrchestrator:
         active_goals = await self.permanent_mgr.get_active_goals(user_id)
         goals_embeddings = [g.embedding for g in active_goals if g.embedding is not None]
 
-        # 4. Extract semantic intent & proactive memory flag
+        # 4. Proactive Memory Engine
+        proactive_eval = await self.proactive_engine.evaluate_proactive_opportunity(
+            user_id=user_id,
+            query=prompt,
+            query_embedding=prompt_emb,
+            working_messages=working_msgs,
+            now=now
+        )
+        proactive_nudge = proactive_eval.get("directive") if proactive_eval.get("triggered") else None
+
+        # 5. Extract semantic intent & proactive memory flag
         intent_res = await self.metacognition.detect_intent(prompt, now=now)
         intent = intent_res.get("intent", "general")
 
@@ -359,6 +393,8 @@ class CognitiveOrchestrator:
                     "mode_rationale": "Blocked prompt injection attempt.",
                     "is_rephrasing": is_rephrasing,
                     "rephrase_score": rephrase_score,
+                    "turn_surprise": turn_surprise,
+                    "proactive_memory": proactive_eval,
                     "retrieved_memories_count": 0,
                     "retrieved_memories": [],
                     "is_cold_start": is_cold_start,
@@ -370,7 +406,7 @@ class CognitiveOrchestrator:
         date_range = intent_res.get("date_range")
         requires_retrieval = intent_res.get("requires_retrieval", True)
 
-        # 5. Multi-factor memory retrieval
+        # 6. Multi-factor memory retrieval with temporal term & Personalized PageRank
         retrieved_memories = []
         if requires_retrieval:
             retrieved_memories = await self.retriever.retrieve(
@@ -392,13 +428,13 @@ class CognitiveOrchestrator:
         )
         thinking_mode: ThinkingMode = meta_eval["mode"]
 
-        # 6. Fetch persona state
+        # 7. Fetch persona state
         persona_state = await self.persona_engine.get_or_create_profile(user_id)
 
         # Fetch permanent facts for identity and project context continuity
         permanent_facts = await self.permanent_mgr.get_user_facts(user_id, limit=20)
 
-        # 7. Assemble Unified Prompt
+        # 8. Assemble Unified Prompt
         assembled_prompt = ContextAssembler.build_prompt(
             user_query=prompt,
             working_messages=working_msgs,
@@ -409,7 +445,8 @@ class CognitiveOrchestrator:
             is_cold_start=is_cold_start,
             now=now,
             permanent_facts=permanent_facts,
-            attached_documents=doc_contexts
+            attached_documents=doc_contexts,
+            proactive_nudge=proactive_nudge
         )
 
         initial_trace = {
@@ -418,6 +455,8 @@ class CognitiveOrchestrator:
             "mode_rationale": meta_eval["rationale"],
             "is_rephrasing": is_rephrasing,
             "rephrase_score": rephrase_score,
+            "turn_surprise": turn_surprise,
+            "proactive_memory": proactive_eval,
             "retrieved_memories_count": len(retrieved_memories),
             "retrieved_memories": [m.to_dict() for m in retrieved_memories],
             "is_cold_start": is_cold_start,

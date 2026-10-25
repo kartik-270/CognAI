@@ -22,7 +22,8 @@ class ContextAssembler:
         is_cold_start: bool = False,
         now: Optional[datetime] = None,
         permanent_facts: Optional[List[PermanentMemory]] = None,
-        attached_documents: Optional[List[Dict[str, Any]]] = None
+        attached_documents: Optional[List[Dict[str, Any]]] = None,
+        proactive_nudge: Optional[str] = None
     ) -> str:
         sections = []
 
@@ -82,26 +83,43 @@ class ContextAssembler:
             goal_lines = [f"- {g.title}: {g.description or ''}" for g in active_goals]
             sections.append("USER'S ACTIVE GOALS:\n" + "\n".join(goal_lines))
 
-        # 6. Retrieved Long-Term & Episodic Memories (with temporal relevance)
+        # 7. Proactive Memory Engine Nudge
+        if proactive_nudge:
+            sections.append(f"[{proactive_nudge}]")
+
+        # 8. Retrieved Long-Term & Episodic Memories (with Entity Resolution & Provenance Preservation)
         if retrieved_memories:
-            mem_lines = []
-            for mem in retrieved_memories:
-                time_anchor = ""
-                if mem.created_at:
-                    c_dt = mem.created_at if mem.created_at.tzinfo else mem.created_at.replace(tzinfo=timezone.utc)
-                    time_anchor = f" [Anchor Date: {c_dt.strftime('%Y-%m-%d (%A, %B %d, %Y)')}]"
-                mem_lines.append(f"- [{mem.memory_type.upper()}{time_anchor}] {mem.content}")
+            from app.brain.memory_aggregator import post_retrieval_aggregator
+            aggregation = post_retrieval_aggregator.aggregate_and_resolve(
+                query=user_query,
+                retrieved_memories=retrieved_memories
+            )
+            context_block = aggregation["formatted_context"]
+            if not context_block:
+                # Fallback to direct lines if aggregation produced empty
+                mem_lines = []
+                for mem in retrieved_memories:
+                    time_anchor = ""
+                    if mem.created_at:
+                        c_dt = mem.created_at if mem.created_at.tzinfo else mem.created_at.replace(tzinfo=timezone.utc)
+                        time_anchor = f" [Anchor Date: {c_dt.strftime('%Y-%m-%d (%A, %B %d, %Y)')}]"
+                    mem_lines.append(f"- [{mem.memory_type.upper()}{time_anchor}] {mem.content}")
+                context_block = "\n".join(mem_lines)
+
             sections.append(
-                "RELEVANT MEMORIES (Retrieved from Long-Term Memory):\n"
-                "TEMPORAL REASONING & CALENDAR ARITHMETIC RULES:\n"
-                "1. Each memory indicates its [Anchor Date]. When a memory mentions relative time expressions ('yesterday', 'last week', 'last month', 'next month', 'last year', 'N years ago'), you MUST explicitly calculate and state the exact calendar date, month, or year relative to that memory's [Anchor Date], NOT relative to today's date!\n"
-                "2. Specific Calendar Arithmetic Rules:\n"
-                "   - 'last year' relative to Anchor Date year Y -> explicitly calculate and state the exact year (Y - 1). (e.g., Anchor Date in May 2023 + 'last year' = exactly 2022. State 'in 2022').\n"
+                "RELEVANT MEMORIES (Retrieved, Entity-Resolved & Provenance-Preserved):\n"
+                "TEMPORAL REASONING & ACCURACY RULES:\n"
+                "1. Each fact indicates its canonical Entity and [Anchor Date]. When a fact mentions relative time expressions ('yesterday', 'last week', 'next month', 'last year', 'N years ago'), calculate and output the exact calendar date, month, or year relative to that [Anchor Date].\n"
+                "2. Specific Arithmetic Rules:\n"
+                "   - 'last year' relative to Anchor Date year Y -> explicitly state the exact year (Y - 1). (e.g., Anchor Date in May 2023 + 'last year' = 'in 2022').\n"
                 "   - 'yesterday' relative to Anchor Date -> calculate (Anchor Date - 1 day). (e.g., Anchor Date 8 May 2023 + 'yesterday' = '7 May 2023').\n"
-                "   - 'N years ago' relative to Anchor Date year Y -> explicitly output the year (Y - N).\n"
+                "   - 'N years ago' relative to Anchor Date year Y -> explicitly output the year (Y - N). (e.g., 2023 - 4 = '4 years ago').\n"
                 "   - 'next month' relative to Anchor Date month M -> state the name of month (M + 1).\n"
-                "3. In answers to temporal questions ('When did...?', 'What year...?'), always explicitly include the calculated exact calendar year or date in the answer.\n" +
-                "\n".join(mem_lines)
+                "3. Counting & Attribution:\n"
+                "   - Pay strict attention to the canonical entity tags [MELANIE], [CAROLINE], [MELANIE'S CHILDREN] to avoid confusing speaker identities.\n"
+                "   - For counting questions ('How many...'), sum distinct items across all dates.\n"
+                "4. If the recorded facts do NOT mention the specific thing asked, state clearly: 'I don't have information about that in the recorded conversations.'\n" +
+                context_block
             )
 
         # 7. Working Memory Context (Recent 20 Turns)

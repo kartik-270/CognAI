@@ -1,6 +1,6 @@
 from app.workers.celery_app import celery_app
 from app.core.config import settings
-from app.db.models import Episode, PermanentMemory, Goal, PersonaProfile, User, ChatMessage, DocumentAttachment
+from app.db.models import Episode, PermanentMemory, Goal, PersonaProfile, User, ChatMessage, DocumentAttachment, CognitiveSchema
 from app.services.storage import get_storage_service
 from app.memory.episodic import EpisodicMemoryManager
 from app.memory.consolidation import MemoryConsolidator
@@ -33,7 +33,7 @@ WorkerAsyncSessionLocal = async_sessionmaker(
     autoflush=False
 )
 
-async def _async_consolidate(user_id: str, session_id: str, transcript: str, turn_count: int, session_timestamp: Optional[datetime] = None):
+async def _async_consolidate(user_id: str, session_id: str, transcript: str, turn_count: int, session_timestamp: Optional[datetime] = None, max_turn_surprise: Optional[float] = None):
     async with WorkerAsyncSessionLocal() as db:
         # 1. Store episodic memory, compute surprise and emotional valence/intensity
         episodic_mgr = EpisodicMemoryManager(db)
@@ -42,7 +42,8 @@ async def _async_consolidate(user_id: str, session_id: str, transcript: str, tur
             session_id=session_id,
             transcript=transcript,
             turn_count=turn_count,
-            session_timestamp=session_timestamp
+            session_timestamp=session_timestamp,
+            max_turn_surprise=max_turn_surprise
         )
 
         # 2. Consolidate facts with contradiction detection (MemoryConflictResolver)
@@ -78,14 +79,14 @@ async def _async_consolidate(user_id: str, session_id: str, transcript: str, tur
 
 
 @celery_app.task(bind=True, rate_limit='10/m', max_retries=3, default_retry_delay=60)
-def consolidate_session_task(self, user_id: str, session_id: str, transcript: str, turn_count: int, session_timestamp: Optional[datetime] = None):
+def consolidate_session_task(self, user_id: str, session_id: str, transcript: str, turn_count: int, session_timestamp: Optional[datetime] = None, max_turn_surprise: Optional[float] = None):
     """
     Background consolidation worker task.
     Enforces strict rate_limit='10/m' decorator to protect LLM API quotas.
     Consolidates episodic memory, emotional valence, surprise score, and contradiction detection.
     """
     try:
-        result = asyncio.run(_async_consolidate(user_id, session_id, transcript, turn_count, session_timestamp=session_timestamp))
+        result = asyncio.run(_async_consolidate(user_id, session_id, transcript, turn_count, session_timestamp=session_timestamp, max_turn_surprise=max_turn_surprise))
         logger.info(f"Consolidation task succeeded for user {user_id}, session {session_id}")
         return result
     except Exception as exc:
@@ -101,6 +102,7 @@ async def _async_cascade_delete(user_id: str):
         await db.execute(delete(Episode).where(Episode.user_id == user_id))
         await db.execute(delete(PermanentMemory).where(PermanentMemory.user_id == user_id))
         await db.execute(delete(Goal).where(Goal.user_id == user_id))
+        await db.execute(delete(CognitiveSchema).where(CognitiveSchema.user_id == user_id))
         await db.execute(delete(PersonaProfile).where(PersonaProfile.user_id == user_id))
         await db.execute(delete(ChatMessage).where(ChatMessage.user_id == user_id))
         await db.execute(delete(DocumentAttachment).where(DocumentAttachment.user_id == user_id))

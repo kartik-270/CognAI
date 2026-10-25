@@ -158,3 +158,22 @@ class DocumentAttachment(Base):
     extracted_text = Column(Text, nullable=True)
     is_image = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+
+class CognitiveSchema(Base):
+    __tablename__ = "cognitive_schemas"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(String, nullable=False, index=True)
+    title = Column(String, nullable=False)
+    summary = Column(Text, nullable=False)
+    domain = Column(String, default="general")  # e.g. "technical", "personal", "workflow", "philosophy"
+    confidence = Column(Float, default=1.0)
+    supporting_facts_count = Column(Integer, default=1)
+    
+    # 1024-dim vector for high-level semantic alignment
+    embedding = Column(Vector(1024), nullable=True)
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+

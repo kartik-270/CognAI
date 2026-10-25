@@ -63,11 +63,43 @@ class MetacognitiveMonitor:
 
     async def detect_intent(self, query: str, now: Optional[datetime] = None) -> Dict[str, Any]:
         """
-        Uses background LLM to detect semantic intent and optional hard date ranges.
+        Uses local SLM bridges (Node 1 Prompt Shield & Node 2 Temporal Router) with fast < 15ms execution,
+        falling back to background LLM or deterministic rule heuristics if weights are not yet loaded.
         """
         curr_dt = now if now else datetime.now(timezone.utc)
         curr_date_str = curr_dt.strftime("%Y-%m-%d")
 
+        # 1. Fast SLM Node 1: Prompt Injection Shield
+        try:
+            from app.brain.slm_prompt_shield import get_slm_prompt_shield
+            shield = get_slm_prompt_shield()
+            if shield:
+                is_inj, prob, latency = shield.is_injection(query)
+                if is_inj:
+                    return {
+                        "is_prompt_injection": True,
+                        "requires_retrieval": False,
+                        "intent": "blocked",
+                        "date_range": None,
+                        "source": "slm_prompt_shield",
+                        "confidence": prob
+                    }
+        except Exception:
+            pass
+
+        # 2. Fast SLM Node 2: Temporal Intent Router
+        try:
+            from app.brain.slm_temporal_router import get_slm_temporal_router
+            slm_router = get_slm_temporal_router()
+            if slm_router:
+                slm_res = slm_router.detect_intent(query, now=curr_dt)
+                if slm_res and isinstance(slm_res, dict):
+                    slm_res["source"] = "slm_temporal_router"
+                    return slm_res
+        except Exception:
+            pass
+
+        # 3. Fallback: Secondary background LLM execution
         try:
             prompt = INTENT_PROMPT.format(query=query, curr_date=curr_date_str)
             res = await llm_router.background_task(prompt)
@@ -94,6 +126,7 @@ class MetacognitiveMonitor:
                     parsed["intent"] = "temporal"
                     parsed["requires_retrieval"] = True
 
+                parsed["source"] = "llm_router_fallback"
                 return parsed
         except Exception:
             pass

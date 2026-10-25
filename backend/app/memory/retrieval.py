@@ -6,8 +6,9 @@ import numpy as np
 import re
 import logging
 
-from app.db.models import Episode, PermanentMemory, Goal, ChatMessage
+from app.db.models import Episode, PermanentMemory, Goal, ChatMessage, CognitiveSchema
 from app.llm.router import llm_router
+from app.graph.neo4j_client import neo4j_client
 
 logger = logging.getLogger(__name__)
 
@@ -397,31 +398,59 @@ class MemoryRetriever:
                 "temporal": temporal
             })
 
-        # Process Knowledge Graph (Phase 5)
-        from app.graph.neo4j_client import neo4j_client
-        keywords = [kw for kw in re.findall(r'\b\w{3,}\b', query.lower()) if kw not in {"who", "what", "where", "when", "why", "how", "the", "and", "that", "have", "for", "with", "about"}]
-        graph_triples = await neo4j_client.retrieve_subgraph(user_id, keywords, limit=10)
-        
-        if graph_triples:
-            graph_text = "\n".join([f"({t['subject']}) -[{t['predicate']}]-> ({t['object']})" for t in graph_triples])
-            emb = np.array(await llm_router.embed(graph_text))
-            sim = max(0.0, self._cosine_similarity(query_vec, emb))
-            
-            goal_sim = 0.0
-            if active_goals_embeddings:
-                goal_sim = max([max(0.0, self._cosine_similarity(emb, g_vec)) for g_vec in active_goals_embeddings])
+        # Process Level-3 Multi-Granularity Cognitive Schemas
+        try:
+            schema_stmt = select(CognitiveSchema).where(
+                CognitiveSchema.user_id == user_id,
+                CognitiveSchema.embedding.isnot(None)
+            ).order_by(CognitiveSchema.embedding.cosine_distance(query_vec.tolist())).limit(10)
+            schema_res = await self.db.execute(schema_stmt)
+            schemas = schema_res.scalars().all()
+            for sch in schemas:
+                sch_emb = np.array(sch.embedding)
+                sch_sim = max(0.0, self._cosine_similarity(query_vec, sch_emb))
+                candidates.append({
+                    "id": f"schema_{sch.id}",
+                    "content": f"[COGNITIVE SCHEMA: {sch.domain.upper()}] {sch.title}: {sch.summary}",
+                    "type": "schema",
+                    "embedding": sch_emb,
+                    "created_at": sch.updated_at or now,
+                    "sim": min(1.0, sch_sim + 0.15),  # High-level mental models prioritized
+                    "goal_sim": 0.0,
+                    "surprise": 0.1,
+                    "temporal": 1.05
+                })
+        except Exception as e:
+            logger.warning(f"CognitiveSchema retrieval warning: {e}")
+
+        # Process Knowledge Graph: Personalized PageRank (PPR) Multi-Hop Retrieval
+        keywords = [kw for kw in re.findall(r'\b\w{3,}\b', query.lower()) if kw not in STOP_WORDS]
+        if keywords:
+            graph_triples = await neo4j_client.personalized_pagerank_retrieval(user_id, keywords, limit=12)
+            if graph_triples:
+                graph_lines = [
+                    f"({t['subject']}) -[{t['predicate']} (PPR: {t.get('ppr_score', 1.0)})]-> ({t['object']})"
+                    for t in graph_triples
+                ]
+                graph_text = "\n".join(graph_lines)
+                emb = np.array(await llm_router.embed(graph_text))
+                sim = max(0.0, self._cosine_similarity(query_vec, emb))
                 
-            candidates.append({
-                "id": "neo4j_graph_results",
-                "content": graph_text,
-                "type": "knowledge_graph",
-                "embedding": emb,
-                "created_at": now,
-                "sim": min(1.0, sim + 0.20),  # Boosted keyword match bonus
-                "goal_sim": goal_sim,
-                "surprise": 0.1,
-                "temporal": 1.0
-            })
+                goal_sim = 0.0
+                if active_goals_embeddings:
+                    goal_sim = max([max(0.0, self._cosine_similarity(emb, g_vec)) for g_vec in active_goals_embeddings])
+                    
+                candidates.append({
+                    "id": "neo4j_graph_ppr_results",
+                    "content": f"[KNOWLEDGE GRAPH (Personalized PageRank)]:\n" + graph_text,
+                    "type": "knowledge_graph",
+                    "embedding": emb,
+                    "created_at": now,
+                    "sim": min(1.0, max(sim, 0.65)),  # Boosted PPR graph relevance
+                    "goal_sim": goal_sim,
+                    "surprise": 0.1,
+                    "temporal": 1.15
+                })
 
         if not candidates:
             return []

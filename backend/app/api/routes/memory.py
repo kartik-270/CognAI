@@ -7,7 +7,7 @@ from pydantic import BaseModel
 import uuid
 
 from app.db.database import get_db
-from app.db.models import Episode, PermanentMemory, Goal, PersonaProfile, User
+from app.db.models import Episode, PermanentMemory, Goal, PersonaProfile, User, CognitiveSchema
 from app.api.auth import get_current_user
 from app.memory.permanent import PermanentMemoryManager
 from app.memory.consolidation import MemoryConflictResolver
@@ -82,13 +82,17 @@ async def get_permanent_memories(
 
 @router.get("/goals", response_model=List[GoalResponse])
 async def get_goals(
+    status: Optional[str] = None,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    """Retrieve active goals for authenticated user."""
-    perm_mgr = PermanentMemoryManager(db)
-    goals = await perm_mgr.get_active_goals(user_id=str(current_user.id))
-    return goals
+    """Retrieve goals for authenticated user with optional status filter."""
+    stmt = select(Goal).where(Goal.user_id == str(current_user.id))
+    if status:
+        stmt = stmt.where(Goal.status == status)
+    stmt = stmt.order_by(Goal.updated_at.desc())
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
 
 @router.post("/goals", response_model=GoalResponse)
 async def create_goal(
@@ -105,6 +109,85 @@ async def create_goal(
     )
     return new_goal
 
+@router.patch("/goals/{goal_id}/toggle", response_model=GoalResponse)
+async def toggle_goal_status(
+    goal_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Toggle a goal status between 'active' and 'completed'."""
+    stmt = select(Goal).where(Goal.id == goal_id, Goal.user_id == str(current_user.id))
+    result = await db.execute(stmt)
+    goal = result.scalars().first()
+    if not goal:
+        raise HTTPException(status_code=404, detail="Goal not found or access denied.")
+    goal.status = "completed" if goal.status == "active" else "active"
+    goal.updated_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(goal)
+    return goal
+
+@router.delete("/goals/{goal_id}")
+async def delete_goal(
+    goal_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Delete a goal for authenticated user."""
+    stmt = select(Goal).where(Goal.id == goal_id, Goal.user_id == str(current_user.id))
+    result = await db.execute(stmt)
+    goal = result.scalars().first()
+    if not goal:
+        raise HTTPException(status_code=404, detail="Goal not found or access denied.")
+    await db.execute(delete(Goal).where(Goal.id == goal_id, Goal.user_id == str(current_user.id)))
+    await db.commit()
+    return {"status": "deleted", "id": str(goal_id)}
+
+
+@router.get("/schemas")
+async def get_cognitive_schemas(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Retrieve Level-3 Multi-Granularity Schemas for authenticated user."""
+    stmt = select(CognitiveSchema).where(
+        CognitiveSchema.user_id == str(current_user.id)
+    ).order_by(CognitiveSchema.updated_at.desc())
+    result = await db.execute(stmt)
+    schemas = result.scalars().all()
+    return [
+        {
+            "id": str(s.id),
+            "title": s.title,
+            "summary": s.summary,
+            "domain": s.domain,
+            "confidence": s.confidence,
+            "supporting_facts_count": s.supporting_facts_count,
+            "updated_at": s.updated_at.isoformat() if s.updated_at else None
+        }
+        for s in schemas
+    ]
+
+
+@router.delete("/schemas/{schema_id}")
+async def delete_cognitive_schema(
+    schema_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Delete a Level-3 Cognitive Schema for authenticated user."""
+    stmt = select(CognitiveSchema).where(
+        CognitiveSchema.id == schema_id,
+        CognitiveSchema.user_id == str(current_user.id)
+    )
+    result = await db.execute(stmt)
+    schema = result.scalars().first()
+    if not schema:
+        raise HTTPException(status_code=404, detail="Schema not found or access denied.")
+    await db.execute(delete(CognitiveSchema).where(CognitiveSchema.id == schema_id, CognitiveSchema.user_id == str(current_user.id)))
+    await db.commit()
+    return {"status": "deleted", "id": str(schema_id), "type": "schema"}
+    
 @router.post("/forget-me")
 async def forget_me(
     current_user: User = Depends(get_current_user),

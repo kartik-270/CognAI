@@ -76,6 +76,17 @@ class EpisodicMemoryManager:
         surprise = float(np.clip(1.0 - cosine_sim, 0.0, 1.0))
         return surprise
 
+    @staticmethod
+    def compute_multi_scale_surprise(session_surprise: float, max_turn_surprise: Optional[float] = None) -> float:
+        """
+        Multi-Scale Surprise:
+        Combines session-level macro surprise (60%) with intra-session peak turn-level surprise (40%).
+        """
+        if max_turn_surprise is None:
+            return round(session_surprise, 4)
+        multi_scale = 0.6 * session_surprise + 0.4 * max_turn_surprise
+        return round(float(np.clip(multi_scale, 0.0, 1.0)), 4)
+
     async def extract_session_emotions_and_summary(self, transcript: str) -> Dict[str, Any]:
         """
         Uses background LLM (Gemini 2.0 Flash) to tag emotional valence and summarize.
@@ -111,12 +122,14 @@ class EpisodicMemoryManager:
         session_id: str,
         transcript: str,
         turn_count: int,
-        session_timestamp: Optional[datetime] = None
+        session_timestamp: Optional[datetime] = None,
+        max_turn_surprise: Optional[float] = None
     ) -> Episode:
         """
         Creates, tags, embeds, and commits episodic memory row(s).
         For long sessions (>20 turns), chunks into 20-turn episode windows grouped under the same session_id
         so no turn-level context, speaker dialogue, or source IDs are lost.
+        Multi-Scale Surprise: Combines session surprise with max turn surprise.
         """
         raw_lines = [line.strip() for line in transcript.split("\n") if line.strip()]
         
@@ -153,7 +166,8 @@ class EpisodicMemoryManager:
 
             # Compute embedding for chunk
             embedding = await llm_router.embed(chunk_content)
-            surprise = await self.compute_surprise_score(user_id, embedding)
+            session_surprise = await self.compute_surprise_score(user_id, embedding)
+            multi_scale_score = self.compute_multi_scale_surprise(session_surprise, max_turn_surprise)
 
             ep = Episode(
                 user_id=user_id,
@@ -162,7 +176,7 @@ class EpisodicMemoryManager:
                 embedding=embedding,
                 emotional_valence=analysis["emotional_valence"],
                 emotional_intensity=analysis["emotional_intensity"],
-                surprise_score=surprise,
+                surprise_score=multi_scale_score,
                 turn_count=len(chunk)
             )
             if session_timestamp is not None:
