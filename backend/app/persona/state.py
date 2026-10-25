@@ -36,7 +36,7 @@ class PersonaState(BaseModel):
 
         # 1. Verbosity Adaptation
         if self.verbosity_ratio <= 0.6:
-            directives.append("- The user prefers terse, high-density responses. Keep your answers direct, crisp, and avoid filler.")
+            directives.append("- The user prefers high-density responses. Keep your answers direct, crisp, and avoid filler.")
         elif self.verbosity_ratio > 1.5:
             directives.append("- The user enjoys conversational, comprehensive explanations. Provide thorough details and conversational flow.")
 

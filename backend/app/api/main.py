@@ -5,7 +5,7 @@ from app.core.config import settings
 from app.db.database import close_connections, engine
 from app.db.models import Base
 from app.api import auth
-from app.api.routes import chat, memory
+from app.api.routes import chat, memory, persona
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -38,6 +38,7 @@ app.add_middleware(
 app.include_router(auth.router)
 app.include_router(chat.router)
 app.include_router(memory.router)
+app.include_router(persona.router)
 
 
 @app.get("/health")

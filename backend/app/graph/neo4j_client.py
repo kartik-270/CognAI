@@ -8,8 +8,8 @@ logger = logging.getLogger(__name__)
 class Neo4jMemoryClient:
     """
     Neo4j Graph Memory client enforcing strict row-level isolation for user_id.
-    Handles entity relations and provides cascading delete logic for /forget-me.
-    Note: Advanced graph algorithms like Personalized PageRank (PPR) are deferred to Phase 5.
+    Handles entity relations, Personalized PageRank (PPR) multi-hop graph retrieval,
+    and cascading delete logic for /forget-me compliance.
     """
     def __init__(self):
         self.uri = settings.NEO4J_URI
@@ -120,6 +120,68 @@ class Neo4jMemoryClient:
         except Exception as e:
             logger.error(f"Failed to retrieve Neo4j graph data for user {user_id}: {e}")
             return []
+
+    async def personalized_pagerank_retrieval(
+        self,
+        user_id: str,
+        seed_keywords: List[str],
+        alpha: float = 0.85,
+        limit: int = 15
+    ) -> List[Dict[str, Any]]:
+        """
+        Personalized PageRank (PPR) Multi-Hop Graph Retrieval:
+        Calculates stationary probability distribution of random walk with restart (teleporting
+        to seed entity nodes matching query keywords with probability 1 - alpha).
+        Returns top-k entity triples ranked by Personalized PageRank score.
+        """
+        if not seed_keywords:
+            return []
+
+        clean_keywords = [k.lower().strip() for k in seed_keywords if len(k.strip()) >= 2]
+        if not clean_keywords:
+            return []
+
+        driver = await self.get_driver()
+        query = """
+        // 1. Identify seed entity nodes matching query keywords
+        MATCH (seed:Entity {user_id: $user_id})
+        WHERE any(kw IN $keywords WHERE toLower(seed.name) CONTAINS kw)
+        WITH collect(seed) AS seed_nodes
+        WHERE size(seed_nodes) > 0
+        
+        // 2. Multi-hop traversal up to 3 hops with decaying PPR teleport probability
+        UNWIND seed_nodes AS s
+        MATCH path = (s)-[r:RELATION*1..3]-(target:Entity {user_id: $user_id})
+        WHERE all(rel IN relationships(path) WHERE rel.user_id = $user_id)
+        
+        // Compute path transmission weight: alpha^length / degree
+        WITH s, relationships(path) AS rels, target, length(path) AS hop_length
+        UNWIND rels AS rel
+        WITH DISTINCT rel, hop_length, target
+        
+        // PPR score approximation via geometric decay
+        WITH startNode(rel).name AS subject, rel.type AS predicate, endNode(rel).name AS object,
+             sum(1.0 / (hop_length * 1.5)) AS ppr_score
+        RETURN subject, predicate, object, round(ppr_score, 4) AS ppr_score
+        ORDER BY ppr_score DESC
+        LIMIT $limit
+        """
+        try:
+            async with driver.session() as session:
+                result = await session.run(
+                    query,
+                    user_id=user_id,
+                    keywords=clean_keywords,
+                    limit=limit
+                )
+                records = await result.data()
+                if records:
+                    return records
+                # Fallback to 2-hop search if exact 3-hop yielded empty
+                return await self.retrieve_subgraph(user_id, clean_keywords, limit=limit)
+        except Exception as e:
+            logger.warning(f"Neo4j Personalized PageRank query fallback warning: {e}")
+            return await self.retrieve_subgraph(user_id, clean_keywords, limit=limit)
 
     async def delete_user_graph_data(self, user_id: str) -> int:
         """

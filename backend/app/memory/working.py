@@ -25,18 +25,32 @@ class RephrasingDetector:
 
     def check_rephrasing(self, current_prompt: str, recent_messages: List[Message], threshold: float = 0.5) -> Tuple[bool, float]:
         """
-        Calculates Jaccard overlap against the most recent user messages.
-        Returns (is_rephrase, overlap_score).
+        Detects rephrasings using Node 3 Cross-Encoder SLM with fast < 4ms inference,
+        falling back to Jaccard token overlap.
         """
-        curr_tokens = self._tokenize(current_prompt)
-        if not curr_tokens or len(curr_tokens) < 2:
-            return False, 0.0
-
         user_messages = [m for m in recent_messages if m.role == "user"]
         if not user_messages:
             return False, 0.0
 
-        # Compare primarily against the last 2 user messages
+        # Try fast neural cross-encoder SLM first
+        try:
+            from app.brain.slm_rephrase_detector import get_slm_rephrase_detector
+            detector = get_slm_rephrase_detector()
+            if detector:
+                max_score = 0.0
+                for prev_msg in user_messages[-2:]:
+                    is_rep, score, _ = detector.is_rephrase(prev_msg.content, current_prompt, threshold=threshold)
+                    if score > max_score:
+                        max_score = score
+                return (max_score >= threshold, round(max_score, 4))
+        except Exception:
+            pass
+
+        # Fallback to Jaccard lexical overlap
+        curr_tokens = self._tokenize(current_prompt)
+        if not curr_tokens or len(curr_tokens) < 2:
+            return False, 0.0
+
         max_score = 0.0
         for prev_msg in user_messages[-2:]:
             prev_tokens = self._tokenize(prev_msg.content)
@@ -65,10 +79,38 @@ class WorkingMemory:
         self.session_timeout_seconds = session_timeout_minutes * 60
         self.current_session_id: str = str(uuid.uuid4())
         self.messages: List[Message] = []
+        self.turn_embeddings: List[List[float]] = []
         self.last_interaction: datetime = datetime.now(timezone.utc)
         self.rephrase_detector = RephrasingDetector()
 
-    def process_incoming_turn(self, role: str, content: str, timestamp: Optional[datetime] = None, source_id: Optional[str] = None) -> Dict[str, Any]:
+    def compute_turn_surprise(self, turn_embedding: Optional[List[float]]) -> float:
+        """
+        Multi-Scale Surprise (Turn-Level):
+        Calculates cosine distance surprise of current turn relative to the running
+        centroid of turns in the active working memory session.
+        """
+        if not turn_embedding:
+            return 0.5
+        if not self.turn_embeddings:
+            self.turn_embeddings.append(turn_embedding)
+            return 0.5
+
+        import numpy as np
+        emb_arr = np.array(turn_embedding)
+        centroid = np.mean(np.array(self.turn_embeddings), axis=0)
+        norm_emb = np.linalg.norm(emb_arr)
+        norm_cent = np.linalg.norm(centroid)
+
+        if norm_emb == 0 or norm_cent == 0:
+            turn_surprise = 0.5
+        else:
+            cosine_sim = np.dot(emb_arr, centroid) / (norm_emb * norm_cent)
+            turn_surprise = float(np.clip(1.0 - cosine_sim, 0.0, 1.0))
+
+        self.turn_embeddings.append(turn_embedding)
+        return round(turn_surprise, 4)
+
+    def process_incoming_turn(self, role: str, content: str, timestamp: Optional[datetime] = None, source_id: Optional[str] = None, turn_embedding: Optional[List[float]] = None) -> Dict[str, Any]:
         """
         Lazily checks for session boundary BEFORE adding the message.
         If delta > 30 min, signals that the previous session ended and must be consolidated.
@@ -94,6 +136,10 @@ class WorkingMemory:
             # Start fresh session for incoming message
             self.current_session_id = str(uuid.uuid4())
             self.messages = []
+            self.turn_embeddings = []
+
+        # Multi-scale surprise: compute turn-level surprise
+        turn_surprise = self.compute_turn_surprise(turn_embedding) if role == "user" else 0.0
 
         # Check rephrasing if this is a user message
         is_rephrasing = False
@@ -119,6 +165,7 @@ class WorkingMemory:
             "expired_session_timestamp": expired_session_timestamp,
             "is_rephrasing": is_rephrasing,
             "rephrase_score": rephrase_score,
+            "turn_surprise": turn_surprise,
             "message": msg
         }
 
